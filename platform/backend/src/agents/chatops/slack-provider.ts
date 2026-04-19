@@ -253,17 +253,6 @@ class SlackProvider implements ChatOpsProvider {
     const isThreadReply = Boolean(event.thread_ts);
     const isDM = event.channel_type === "im";
 
-    // In channels (including thread replies), only respond when the bot is
-    // @mentioned (app_mention event or message text containing <@BOT_ID>).
-    // DMs are always processed without requiring a mention.
-    if (!isDM) {
-      const hasBotMention =
-        this.botUserId && text.includes(`<@${this.botUserId}>`);
-      if (event.type !== "app_mention" && !hasBotMention) {
-        return null;
-      }
-    }
-
     const cleanedText = this.cleanBotMention(text);
     if (!cleanedText && event.type !== "app_mention") {
       return null;

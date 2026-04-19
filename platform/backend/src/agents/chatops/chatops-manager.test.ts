@@ -881,6 +881,215 @@ describe("ChatOpsManager.handleIncomingMessage empty Slack mention", () => {
   });
 });
 
+describe("ChatOpsManager.handleIncomingMessage Slack request classifier", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.stubEnv("ARCHESTRA_CHAT_OPENAI_API_KEY", "test-openai-key");
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  function createSlackProvider(params: {
+    email: string;
+    message: IncomingChatMessage;
+  }): ChatOpsProvider {
+    return {
+      providerId: "slack",
+      displayName: "Slack",
+      isConfigured: () => true,
+      initialize: async () => {},
+      cleanup: async () => {},
+      validateWebhookRequest: async () => true,
+      handleValidationChallenge: () => null,
+      parseWebhookNotification: async () => params.message,
+      sendReply: async () => "reply-id",
+      parseInteractivePayload: () => null,
+      sendAgentSelectionCard: async () => {},
+      getThreadHistory: async () => [],
+      getUserEmail: async () => params.email,
+      getChannelName: async () => "test-channel",
+      getWorkspaceId: () => "T_TEST",
+      getWorkspaceName: () => "Test Workspace",
+      hasMissingScopes: () => false,
+      notifyMissingScopes: async () => {},
+      downloadFiles: async () => [],
+      discoverChannels: async () => [],
+    };
+  }
+
+  test("runs classifier for non-mentioned Slack channel messages and skips processing on ignore", async ({
+    makeUser,
+    makeOrganization,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "classifier-ignore@example.com" });
+    const org = await makeOrganization();
+    const agent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Slack Agent",
+    });
+
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "slack",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      agentId: agent.id,
+    });
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ content: [{ type: "text", text: "ignore" }] }),
+    }) as typeof fetch;
+
+    const message: IncomingChatMessage = {
+      messageId: "slack-classifier-ignore",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      threadId: "1772498106.893979",
+      senderId: "U_TEST",
+      senderName: user.name,
+      text: "can someone help with staging?",
+      rawText: "can someone help with staging?",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: {
+        eventType: "message",
+        channelType: "channel",
+      },
+    };
+
+    const provider = createSlackProvider({ email: user.email, message });
+    const manager = new ChatOpsManager();
+    const processMessageSpy = vi
+      .spyOn(manager, "processMessage")
+      .mockResolvedValue({ success: true });
+
+    await manager.handleIncomingMessage(provider, message);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(processMessageSpy).not.toHaveBeenCalled();
+  });
+
+  test("classifier allow-list continues processing for non-mentioned Slack channel messages", async ({
+    makeUser,
+    makeOrganization,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "classifier-respond@example.com" });
+    const org = await makeOrganization();
+    const agent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Slack Agent",
+    });
+
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "slack",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      agentId: agent.id,
+    });
+
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ content: [{ type: "text", text: "respond" }] }),
+    }) as typeof fetch;
+
+    const message: IncomingChatMessage = {
+      messageId: "slack-classifier-respond",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      threadId: "1772498106.893979",
+      senderId: "U_TEST",
+      senderName: user.name,
+      text: "summarize what changed in this thread",
+      rawText: "summarize what changed in this thread",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: {
+        eventType: "message",
+        channelType: "channel",
+      },
+    };
+
+    const provider = createSlackProvider({ email: user.email, message });
+    const manager = new ChatOpsManager();
+    const processMessageSpy = vi
+      .spyOn(manager, "processMessage")
+      .mockResolvedValue({ success: true });
+
+    await manager.handleIncomingMessage(provider, message);
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(processMessageSpy).toHaveBeenCalledWith({
+      message,
+      provider,
+      sendReply: true,
+    });
+  });
+
+  test("skips classifier for Slack app mentions", async ({
+    makeUser,
+    makeOrganization,
+    makeInternalAgent,
+  }) => {
+    const user = await makeUser({ email: "classifier-mention@example.com" });
+    const org = await makeOrganization();
+    const agent = await makeInternalAgent({
+      organizationId: org.id,
+      name: "Slack Agent",
+    });
+
+    await ChatOpsChannelBindingModel.create({
+      organizationId: org.id,
+      provider: "slack",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      agentId: agent.id,
+    });
+
+    global.fetch = vi.fn() as typeof fetch;
+
+    const message: IncomingChatMessage = {
+      messageId: "slack-classifier-mention",
+      channelId: "C_TEST",
+      workspaceId: "T_TEST",
+      threadId: "1772498106.893979",
+      senderId: "U_TEST",
+      senderName: user.name,
+      text: "what changed today?",
+      rawText: "<@UBOT123> what changed today?",
+      timestamp: new Date(),
+      isThreadReply: false,
+      metadata: {
+        eventType: "app_mention",
+        channelType: "channel",
+      },
+    };
+
+    const provider = createSlackProvider({ email: user.email, message });
+    const manager = new ChatOpsManager();
+    const processMessageSpy = vi
+      .spyOn(manager, "processMessage")
+      .mockResolvedValue({ success: true });
+
+    await manager.handleIncomingMessage(provider, message);
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(processMessageSpy).toHaveBeenCalledWith({
+      message,
+      provider,
+      sendReply: true,
+    });
+  });
+});
+
 describe("ChatOpsManager.handleIncomingMessage missing scope notification", () => {
   function createScopeTestProvider(
     overrides: {

@@ -258,12 +258,26 @@ describe("SlackProvider.parseWebhookNotification", () => {
 
   test("message event returns parsed IncomingChatMessage", async () => {
     const provider = createProvider();
-    const payload = makeEventPayload({}, { type: "message" });
+    const payload = makeEventPayload({}, { type: "message", text: "hello world" });
 
     const result = await provider.parseWebhookNotification(payload, {});
 
     expect(result).not.toBeNull();
     expect(result?.text).toBe("hello world");
+    expect(result?.rawText).toBe("hello world");
+  });
+
+  test("non-mentioned channel message is parsed for downstream classification", async () => {
+    const provider = createProvider();
+    const payload = makeEventPayload(
+      {},
+      { type: "message", channel_type: "channel", text: "can you summarize this thread?" },
+    );
+
+    const result = await provider.parseWebhookNotification(payload, {});
+
+    expect(result).not.toBeNull();
+    expect(result?.text).toBe("can you summarize this thread?");
   });
 
   test("bot message with bot_id returns null", async () => {

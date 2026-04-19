@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { generateText } from "ai";
 import { type A2AAttachment, executeA2AMessage } from "@/agents/a2a-executor";
 import { userHasPermission } from "@/auth/utils";
 import { type AllowedCacheKey, CacheKey, cacheManager } from "@/cache-manager";
+import { createDirectLLMModel, isApiKeyRequired } from "@/clients/llm-client";
 import logger from "@/logging";
 import {
   AgentModel,
@@ -20,6 +22,8 @@ import type {
   ChatOpsProviderType,
   IncomingChatMessage,
 } from "@/types";
+import { resolveProviderApiKey } from "@/utils/llm-api-key-resolution";
+import { resolveFastModelName } from "@/utils/llm-resolution";
 import {
   autoProvisionUser,
   buildWelcomeMessage,
@@ -471,6 +475,17 @@ export class ChatOpsManager {
       return;
     }
 
+    if (await this.shouldClassifySlackChannelMessage({ provider, message })) {
+      const shouldRespond = await this.isRequestLikeSlackMessage({
+        message,
+        organizationId: binding.organizationId,
+        userId: user.id,
+      });
+      if (!shouldRespond) {
+        return;
+      }
+    }
+
     // Process message through assigned agent
     await this.processMessage({
       message,
@@ -750,6 +765,83 @@ export class ChatOpsManager {
         { error: errorMessage(error) },
         "[ChatOps] Failed to send auto-provision welcome message",
       );
+    }
+  }
+
+  private async shouldClassifySlackChannelMessage(params: {
+    provider: ChatOpsProvider;
+    message: IncomingChatMessage;
+  }): Promise<boolean> {
+    const { provider, message } = params;
+    return (
+      provider.providerId === "slack" &&
+      message.metadata?.channelType !== "im" &&
+      message.metadata?.eventType !== "app_mention"
+    );
+  }
+
+  private async isRequestLikeSlackMessage(params: {
+    message: IncomingChatMessage;
+    organizationId: string;
+    userId: string;
+  }): Promise<boolean> {
+    const { message, organizationId, userId } = params;
+    const text = message.text.trim();
+    if (!text || text.length < MIN_CLASSIFIER_TEXT_LENGTH) {
+      return false;
+    }
+
+    const provider = "openai" as const;
+    const { apiKey, chatApiKeyId, baseUrl, source } =
+      await resolveProviderApiKey({
+        organizationId,
+        userId,
+        provider,
+      });
+
+    if (isApiKeyRequired(provider, apiKey)) {
+      logger.debug(
+        "[ChatOps] Skipping Slack request-like classifier: missing OpenAI API key",
+      );
+      return false;
+    }
+
+    try {
+      const modelName = await resolveFastModelName(provider, chatApiKeyId);
+      const model = createDirectLLMModel({
+        provider,
+        apiKey,
+        modelName,
+        baseUrl,
+      });
+
+      const result = await generateText({
+        model,
+        system: SLACK_REQUEST_CLASSIFIER_SYSTEM_PROMPT,
+        prompt: `Message: ${JSON.stringify(text)}`,
+        temperature: 0,
+        maxOutputTokens: 20,
+      });
+      const decision = result.text.trim().toLowerCase();
+
+      logger.debug(
+        {
+          messageId: message.messageId,
+          modelName,
+          source,
+          chatApiKeyId,
+          decision,
+        },
+        "[ChatOps] Slack request-like classifier completed",
+      );
+
+      return decision === "respond";
+    } catch (error) {
+      logger.warn(
+        { error: errorMessage(error), messageId: message.messageId },
+        "[ChatOps] Slack request-like classifier failed",
+      );
+      return false;
     }
   }
 
@@ -1381,6 +1473,13 @@ export function buildChatOpsSessionId(
   const hash = createHash("sha256").update(id).digest("hex").slice(0, 16);
   return `${prefix}${hash}`;
 }
+
+const MIN_CLASSIFIER_TEXT_LENGTH = 8;
+const SLACK_REQUEST_CLASSIFIER_SYSTEM_PROMPT = [
+  'Return exactly one word: "respond" or "ignore".',
+  "Respond means the Slack message is asking for help, analysis, an answer, a summary, or an action.",
+  "Ignore means casual chat, acknowledgements, jokes, reactions, or human-to-human discussion.",
+].join(" ");
 
 // Prometheus exemplar labels allow 128 UTF-8 chars total (keys + values).
 // traceID (7+32) + spanID (6+16) = 61; remaining for sessionID key (9) + value = 58.
