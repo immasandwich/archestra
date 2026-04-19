@@ -11,6 +11,7 @@ import {
   ChatOpsChannelBindingModel,
   ChatOpsConfigModel,
   ChatOpsProcessedMessageModel,
+  LlmProviderApiKeyModel,
   OrganizationModel,
   UserModel,
 } from "@/models";
@@ -38,6 +39,7 @@ import {
 import MSTeamsProvider from "./ms-teams-provider";
 import SlackProvider from "./slack-provider";
 import { errorMessage, isSlackDmChannel } from "./utils";
+import type { SupportedProvider } from "@shared";
 
 /**
  * ChatOps Manager - handles chatops provider lifecycle and message processing
@@ -479,8 +481,10 @@ export class ChatOpsManager {
       const shouldRespond = await this.isRequestLikeSlackMessage({
         message,
         organizationId: binding.organizationId,
+        agentId: binding.agentId,
         userId: user.id,
       });
+
       if (!shouldRespond) {
         return;
       }
@@ -783,25 +787,41 @@ export class ChatOpsManager {
   private async isRequestLikeSlackMessage(params: {
     message: IncomingChatMessage;
     organizationId: string;
+    agentId: string;
     userId: string;
   }): Promise<boolean> {
-    const { message, organizationId, userId } = params;
+    const { message, organizationId, agentId, userId } = params;
+
+    // Only classify messages with sufficient text content
     const text = message.text.trim();
     if (!text || text.length < MIN_CLASSIFIER_TEXT_LENGTH) {
       return false;
     }
 
-    const provider = "openai" as const;
+    // Use the agent's LLM provider and API key to classify the message, ensuring consistency with the agent's capabilities and avoiding cross-provider issues (e.g., Slack messages often contain formatting that can confuse models when not parsed the same way as the agent's messages).
+    const agent = await AgentModel.findById(agentId);
+
+    if (!agent) {
+      return false;
+    }
+
+    const provider = await this.resolveProviderFromAgent(agent);
+
+    if (!provider) {
+      return false;
+    }
+
     const { apiKey, chatApiKeyId, baseUrl, source } =
       await resolveProviderApiKey({
         organizationId,
         userId,
         provider,
+        agentLlmApiKeyId: agent.llmApiKeyId,
       });
 
     if (isApiKeyRequired(provider, apiKey)) {
       logger.debug(
-        "[ChatOps] Skipping Slack request-like classifier: missing OpenAI API key",
+        "[ChatOps] Skipping Slack request-like classifier due to missing API key for agent's provider",
       );
       return false;
     }
@@ -843,6 +863,27 @@ export class ChatOpsManager {
       );
       return false;
     }
+  }
+
+  private async resolveProviderFromAgent(agent: {
+    id: string;
+    name: string;
+    agentType: string;
+    llmApiKeyId?: string;
+  }): Promise<SupportedProvider | null> {
+    if (!agent || agent.agentType !== "agent") {
+      return null;
+    }
+
+    if (agent.llmApiKeyId) {
+      const apiKey = await LlmProviderApiKeyModel.findById(agent.llmApiKeyId);
+
+      if (apiKey) {
+        return apiKey.provider;
+      }
+    }
+
+    return null;
   }
 
   private async sendAgentSelectionCard({
